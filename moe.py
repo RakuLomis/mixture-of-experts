@@ -45,21 +45,36 @@ class SparseDispatcher(object):
     `Tensor`s for expert i only the batch elements for which `gates[b, i] > 0`.
     """
 
-    def __init__(self, num_experts, gates):
+    def __init__(self, num_experts, gates): # gates: (batch_size, expert_score)
         """Create a SparseDispatcher."""
 
         self._gates = gates
         self._num_experts = num_experts
         # sort experts
+        # .nonzero(gates) returns the position of nonzero value in gates 
+        # e.g., gates = [[1, 0, 1], [0, 1, 0], [0, 1, 1]], 
+        # torch.nonzero(gates) = [[0, 2], [1, 1], [0, 0], [2, 1], [2, 2]], the element's shape means [batch, expert_index] 
+        # .sort(0) means order the target by column independently, return the ordered result and original position (indecies) 
+        # e.g., [[0, 2], [1, 1], [0, 1]], after sort(0), we have
+        # sorted values [[0, 1], [0, 1], [1, 2]], original indeces [[0, 1], [2, 2], [1, 1]]
+        # for the example gates, after .nonzero(gates).sort(0), we have 
+        # [[0, 0], [0, 1], [1, 1], [2, 2], [2, 2]] and [[0, 2], [2, 1], [1, 3], [3, 0], [4, 4]], which means the original tensor is descending
         sorted_experts, index_sorted_experts = torch.nonzero(gates).sort(0)
         # drop indices
-        _, self._expert_index = sorted_experts.split(1, dim=1)
+        # get the experts' indecies, but loss the combination between batch and expert
+        # _expert_index = [[0], [1], [1], [2], [2]]
+        _, self._expert_index = sorted_experts.split(1, dim=1) # indeed, it returns a tuple
         # get according batch index for each expert
-        self._batch_index = torch.nonzero(gates)[index_sorted_experts[:, 1], 0]
+        # index_sorted_experts[:, 1] = [2, 1, 3, 0, 4], the original experts' indecies 
+        # torch.nonzero(gates)[index_sorted_experts[:, 1], 0] = [0, 1, 2, 0, 2]
+        self._batch_index = torch.nonzero(gates)[index_sorted_experts[:, 1], 0] # the corresponding batch of _expert_index
         # calculate num samples that each expert gets
         self._part_sizes = (gates > 0).sum(0).tolist()
         # expand gates to match with self._batch_index
-        gates_exp = gates[self._batch_index.flatten()]
+        # [[1, 0, 1], [0, 1, 0], [0, 1, 1]]
+        # gates_exp = [[1, 0, 1], [0, 1, 0], [0, 1, 1], [1, 0, 1], [0, 1, 1]]
+        gates_exp = gates[self._batch_index.flatten()] 
+        # [1, 1, 1, 1, 1]
         self._nonzero_gates = torch.gather(gates_exp, 1, self._expert_index)
 
     def dispatch(self, inp):
@@ -76,7 +91,7 @@ class SparseDispatcher(object):
         # assigns samples to experts whose gate is nonzero
 
         # expand according to batch index so we can just split by _part_sizes
-        inp_exp = inp[self._batch_index].squeeze(1)
+        inp_exp = inp[self._batch_index].squeeze(1) # squeeze ensures the dimension is [batch_size, features], not like [batch_size, 1, features]
         return torch.split(inp_exp, self._part_sizes, dim=0)
 
     def combine(self, expert_out, multiply_by_gates=True):
