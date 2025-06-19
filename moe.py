@@ -309,29 +309,70 @@ class MoE(nn.Module):
             gates: a Tensor with shape [batch_size, num_experts]
             load: a Tensor with shape [num_experts]
         """
+        # x: [batch_size, input_size]
+
+        # 1. 计算专家选择的“干净”分数 (Clean Logits)
+        # self.w_gate: [input_size, num_experts]
+        # clean_logits: [batch_size, input_size] @ [input_size, num_experts] = [batch_size, num_experts]
         clean_logits = x @ self.w_gate
+
+        # 2. 有条件地添加噪声 (Noisy Gating)
         if self.noisy_gating and train:
+            # self.w_noise: [input_size, num_experts]
+            # raw_noise_stddev: [batch_size, input_size] @ [input_size, num_experts] = [batch_size, num_experts]
             raw_noise_stddev = x @ self.w_noise
-            noise_stddev = ((self.softplus(raw_noise_stddev) + noise_epsilon))
+            # softplus(x) = log(1 + exp(x)), 确保标准差非负且可微分
+            # noise_stddev: [batch_size, num_experts]
+            noise_stddev = (self.softplus(raw_noise_stddev) + noise_epsilon)
+            # torch.randn_like(clean_logits) 生成与 clean_logits 形状相同的标准正态随机数
+            # noisy_logits = clean_logits + 噪声 (每个元素独立采样)
+            # noisy_logits: [batch_size, num_experts]
             noisy_logits = clean_logits + (torch.randn_like(clean_logits) * noise_stddev)
             logits = noisy_logits
         else:
+            # 评估模式或禁用噪声时，直接使用干净分数
             logits = clean_logits
+        # 此时 logits 形状为 [batch_size, num_experts]
 
-        # calculate topk + 1 that will be needed for the noisy gates
-        logits = self.softmax(logits)
+        # 3. 将 logits 转换为概率分布 (Softmax)
+        # logits: [batch_size, num_experts]
+        logits = self.softmax(logits) # 对每个样本，其所有专家的分数和为 1
+
+        # 4. 选择 Top-K 专家及其门控权重
+        # topk(input, k, dim) 返回值和索引
+        # min(self.k + 1, self.num_experts) 是为了在计算 _prob_in_top_k 时提供足够的阈值信息
+        # top_logits: [batch_size, min(k+1, num_experts)]
+        # top_indices: [batch_size, min(k+1, num_experts)]
         top_logits, top_indices = logits.topk(min(self.k + 1, self.num_experts), dim=1)
+
+        # 选取实际的 Top-K 部分
+        # top_k_logits: [batch_size, k]
         top_k_logits = top_logits[:, :self.k]
+        # top_k_indices: [batch_size, k]
         top_k_indices = top_indices[:, :self.k]
-        top_k_gates = top_k_logits / (top_k_logits.sum(1, keepdim=True) + 1e-6)  # normalization
 
+        # 归一化 Top-K 门控权重，使每个样本选中的 k 个专家权重之和为 1
+        # top_k_gates: [batch_size, k]
+        top_k_gates = top_k_logits / (top_k_logits.sum(1, keepdim=True) + 1e-6)  # 1e-6 避免除以零
+
+        # 5. 构建稀疏的门控张量 (Full Gates Tensor)
+        # zeros: [batch_size, num_experts]，全零张量
         zeros = torch.zeros_like(logits, requires_grad=True)
+        # scatter(dim, index, src) 将 src 中的值，根据 index 散布到 dim 指定的维度上
+        # gates: [batch_size, num_experts]
         gates = zeros.scatter(1, top_k_indices, top_k_gates)
+        # 此时，gates 张量中只有每个样本被选中的 k 个专家对应的位置有非零值 (归一化后的权重)，其他为零。
 
+        # 6. 计算专家负载 (Load)
         if self.noisy_gating and self.k < self.num_experts and train:
+            # 如果使用噪声门控且在训练模式，且并非所有专家都选中，则使用可微分的概率来计算负载
+            # load: [num_experts]
             load = (self._prob_in_top_k(clean_logits, noisy_logits, noise_stddev, top_logits)).sum(0)
         else:
-            load = self._gates_to_load(gates)
+            # 否则，使用简单的非可微分计数方式计算负载
+            # load: [num_experts]
+            load = self._gates_to_load(gates) # 统计 gates > 0 的数量
+
         return gates, load
 
     def forward(self, x, loss_coef=1e-2):
