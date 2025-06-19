@@ -73,8 +73,10 @@ class SparseDispatcher(object):
         # expand gates to match with self._batch_index
         # [[1, 0, 1], [0, 1, 0], [0, 1, 1]]
         # gates_exp = [[1, 0, 1], [0, 1, 0], [0, 1, 1], [1, 0, 1], [0, 1, 1]]
+        # gates_exp is the batches for each expert from expert_0 to expert_e
         gates_exp = gates[self._batch_index.flatten()] 
         # [1, 1, 1, 1, 1]
+        # _nonzero_gates is the weights for each expert in the corresponding batch
         self._nonzero_gates = torch.gather(gates_exp, 1, self._expert_index)
 
     def dispatch(self, inp):
@@ -111,8 +113,8 @@ class SparseDispatcher(object):
         stitched = torch.cat(expert_out, 0)
 
         if multiply_by_gates:
-            stitched = stitched.mul(self._nonzero_gates)
-        zeros = torch.zeros(self._gates.size(0), expert_out[-1].size(1), requires_grad=True, device=stitched.device)
+            stitched = stitched.mul(self._nonzero_gates) # _nonzero_gates will be broadcast
+        zeros = torch.zeros(self._gates.size(0), expert_out[-1].size(1), requires_grad=True, device=stitched.device) # shape: (batch_size, <extra_output_dims>)
         # combine samples that have been processed by the same k experts
         combined = zeros.index_add(0, self._batch_index, stitched.float())
         return combined
@@ -173,7 +175,7 @@ class MoE(nn.Module):
         self.register_buffer("std", torch.tensor([1.0]))
         assert(self.k <= self.num_experts)
 
-    def cv_squared(self, x):
+    def cv_squared(self, x): # Coefficient of Variation, CV
         """The squared coefficient of variation of a sample.
         Useful as a loss to encourage a positive distribution to be more uniform.
         Epsilons added for numerical stability.
@@ -217,20 +219,83 @@ class MoE(nn.Module):
         Returns:
         a `Tensor` of shape [batch, n].
         """
-        batch = clean_values.size(0)
-        m = noisy_top_values.size(1)
+        # clean_values: [batch_size, num_experts] (即 clean_logits)
+        # noisy_values: [batch_size, num_experts] (即 noisy_logits)
+        # noise_stddev: [batch_size, num_experts] (每个专家对应的噪声标准差)
+        # noisy_top_values: [batch_size, min(k+1, num_experts)] (由 noisy_logits.topk 得到的前 k+1 个最大值)
+
+        batch = clean_values.size(0) # batch_size
+        m = noisy_top_values.size(1) # min(self.k + 1, self.num_experts)
+
+        # 1. 展平 noisy_top_values
+        # noisy_top_values: [batch_size, m]
+        # top_values_flat: [batch_size * m]
         top_values_flat = noisy_top_values.flatten()
 
+        # 2. 计算 threshold_if_in (第 k 大的 noisy logit 作为阈值)
+        # threshold_positions_if_in: [batch_size]
+        # (例如，如果 batch_size=2, m=3, k=1, 那么 torch.arange(2)*3 + 1 = [1, 4]
+        # 这表示对于第一个样本，我们取 flat 后的第1个元素 (top_values_flat[1])，即它第二大的值
+        # 对于第二个样本，取 flat 后的第4个元素 (top_values_flat[4])，即它第二大的值
+        # 这里的 k 是 0-indexed，所以 k 表示第 (k+1) 大的值
+        # 如果 self.k = 1, 则取第 2 大的值作为阈值
+        # 如果 self.k = 0, 则取第 1 大的值作为阈值 (即最大值)
+        # 这个索引指向每个样本的第 k 个 top 值 (0-indexed)
         threshold_positions_if_in = torch.arange(batch, device=clean_values.device) * m + self.k
+        # torch.gather(input, dim, index) 从 input 中沿着 dim 收集 index 指定的元素
+        # 这里 input 是 flat 的 top_values_flat，dim=0，index 是 threshold_positions_if_in
+        # threshold_if_in: [batch_size] (然后通过 unsqueeze 变为 [batch_size, 1])
         threshold_if_in = torch.unsqueeze(torch.gather(top_values_flat, 0, threshold_positions_if_in), 1)
+        # threshold_if_in 形状: [batch_size, 1]
+        # 含义: 对于每个样本，其第 k 个 (0-indexed) 最大的带噪声门控分数。
+        # 如果一个专家其 clean_value + noise 大于这个阈值，它就在 top k 之内。
+
+        # 3. 判断哪些专家在 noisy top k 内 (实际发生了什么)
+        # is_in: [batch_size, num_experts] (布尔张量)
         is_in = torch.gt(noisy_values, threshold_if_in)
+        # torch.gt(a, b) 返回一个布尔张量，表示 a > b。
+        # 这里 noisy_values 形状是 [batch_size, num_experts]，
+        # threshold_if_in 形状是 [batch_size, 1]，会自动广播到 [batch_size, num_experts]。
+        # 结果是一个布尔掩码，指示在应用噪声后，哪些专家实际进入了 Top-K。
+
+        # 4. 计算 threshold_if_out (第 k-1 大的 noisy logit 作为阈值)
+        # threshold_positions_if_out: [batch_size]
+        # 这里的索引指向每个样本的第 k-1 个 top 值 (0-indexed)，即 Top-K 之外的最高值。
         threshold_positions_if_out = threshold_positions_if_in - 1
+        # threshold_if_out: [batch_size, 1]
         threshold_if_out = torch.unsqueeze(torch.gather(top_values_flat, 0, threshold_positions_if_out), 1)
-        # is each value currently in the top k.
-        normal = Normal(self.mean, self.std)
+        # 含义: 对于每个样本，其第 k-1 个 (0-indexed) 最大的带噪声门控分数。
+        # 这个阈值用于计算当专家实际不在 Top-K 中时，它进入 Top-K 的概率。
+
+        # 5. 计算概率 (Probabilities using CDF)
+        # self.mean: 0.0 (from register_buffer)
+        # self.std: 1.0 (from register_buffer)
+        normal = Normal(self.mean, self.std) # 标准正态分布
+
+        # prob_if_in: [batch_size, num_experts]
+        # 计算每个 clean_value + N(0, noise_stddev) > threshold_if_in 的概率
         prob_if_in = normal.cdf((clean_values - threshold_if_in)/noise_stddev)
+        # prob_if_out: [batch_size, num_experts]
+        # 计算每个 clean_value + N(0, noise_stddev) > threshold_if_out 的概率
         prob_if_out = normal.cdf((clean_values - threshold_if_out)/noise_stddev)
+        # 注意：这里的 CDF 计算的是 P(Z < X)，而我们想要的是 P(Z > X) = 1 - P(Z < X)
+        # 或者 P(clean_value + noise > threshold) => P(noise > threshold - clean_value)
+        # Z = noise / noise_stddev ~ N(0,1)
+        # P(Z > (threshold - clean_value) / noise_stddev) = 1 - CDF((threshold - clean_value) / noise_stddev)
+        # 由于正态分布对称性：1 - CDF(x) = CDF(-x)
+        # 因此，1 - CDF((threshold - clean_value) / noise_stddev) = CDF(-(threshold - clean_value) / noise_stddev) = CDF((clean_value - threshold) / noise_stddev)
+        # 这就是代码中直接使用 (clean_values - threshold) / noise_stddev 作为输入的原因。
+
+        # 6. 根据实际 Top-K 结果选择合适的概率
+        # prob: [batch_size, num_experts]
         prob = torch.where(is_in, prob_if_in, prob_if_out)
+        # 对于每个专家，如果它在 noisy_values 中实际进入了 top k (is_in 为 True)，
+        # 则使用 prob_if_in (即 clean_value 超过 top k 阈值的概率)。
+        # 如果它没有进入 top k (is_in 为 False)，
+        # 则使用 prob_if_out (即 clean_value 超过 top k-1 阈值的概率)。
+        # 这种选择是为了在梯度下降时，对于那些“刚好”在 Top-K 边缘的专家，提供更平滑的梯度信号，
+        # 促使它们的 clean_logits 要么明确地进入 Top-K，要么明确地离开 Top-K，从而平衡负载。
+
         return prob
 
     def noisy_top_k_gating(self, x, train, noise_epsilon=1e-2):
